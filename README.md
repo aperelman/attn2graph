@@ -6,7 +6,7 @@ A research tool for extracting and analyzing graph-theoretic properties of atten
 
 `attn2graph` bridges sublinear graph algorithm research with large language model internals. It extracts attention weight matrices from pretrained transformers via a containerized HuggingFace inference pipeline, interprets them as weighted graphs, and computes structural properties — with a focus on **arboricity** and related parameters.
 
-Attention matrix extraction runs in an isolated **Docker container** (Python/PyTorch/HuggingFace), decoupling the inference environment from the analysis pipeline. The extracted matrices are native **PyTorch tensors**, making them directly compatible with any PyTorch-based downstream workflow. Graph analysis is performed by **[GraphAnalyzer](https://github.com/aperelman/GraphAnalyzer)**, which can trigger extractions on demand and load the resulting SNAP edge lists for interactive analysis.
+Attention matrix extraction runs in an isolated **Docker container** (Python/PyTorch/HuggingFace), decoupling the inference environment from the analysis pipeline. The extracted matrices are native **PyTorch tensors**, making them directly compatible with any PyTorch-based downstream workflow. Graph analysis is performed by **[GraphAnalyzer](https://github.com/aperelman/GraphAnalyzer)**, which will be able to trigger extractions on demand (future feature), (currently, file can loaded manually) and load the resulting SNAP edge lists for interactive analysis.
 
 ## Architecture
 
