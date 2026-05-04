@@ -2,179 +2,149 @@
 """
 AGA-script — Attention → SNAP edge list
 ========================================
-Extracts attention matrices from a pretrained transformer and writes one SNAP
-edge list per (layer, head) for loading into GraphAnalyzer.
+Extracts attention matrices from any HuggingFace causal LM that exposes
+output_attentions=True, and writes one SNAP edge list per (layer, head)
+for loading into GraphAnalyzer.
 
 Output files: aga_L{layer}_H{head}.txt
 SNAP format:  # comment header, then "src dst" per line (undirected, thresholded)
 
 Usage:
-    python aga_script.py                          — run with defaults (gpt2)
-    python aga_script.py --list-models            — show supported models and exit
-    python aga_script.py --model bert-base        — choose a different model
-    python aga_script.py --model gpt2 --tau 0.02  — custom tau threshold
+    python aga_script.py [--model gpt2] [--tau 0.01] [--prompt "..."] [--outdir ./aga_out]
+    python aga_script.py --list-models [--search qwen] [--limit 20]
 
 Requirements:
-    pip install torch transformers
+    pip install torch transformers accelerate huggingface_hub
 """
 
 import argparse
 import os
-import sys
 
 import torch
-from transformers import AutoModel, AutoTokenizer
-
-# ---------------------------------------------------------------------------
-# Model registry
-# ---------------------------------------------------------------------------
-# Keys are the short names accepted by --model.
-# "hf_id"    : HuggingFace model identifier
-# "family"   : for display grouping
-# "params"   : approximate parameter count (human-readable)
-# "layers"   : number of attention layers
-# "heads"    : attention heads per layer
-# "vram_gb"  : approximate VRAM needed for FP32 inference (rough guide)
-# "cpu_ok"   : comfortable to run on CPU (inference time < ~30s)
-# ---------------------------------------------------------------------------
-MODELS = {
-    # ── GPT-2 family ──────────────────────────────────────────────────────
-    "gpt2": {
-        "hf_id":   "gpt2",
-        "family":  "GPT-2",
-        "params":  "117M",
-        "layers":  12,
-        "heads":   12,
-        "vram_gb": 0.5,
-        "cpu_ok":  True,
-    },
-    "gpt2-medium": {
-        "hf_id":   "gpt2-medium",
-        "family":  "GPT-2",
-        "params":  "345M",
-        "layers":  24,
-        "heads":   16,
-        "vram_gb": 1.5,
-        "cpu_ok":  True,
-    },
-    "gpt2-large": {
-        "hf_id":   "gpt2-large",
-        "family":  "GPT-2",
-        "params":  "774M",
-        "layers":  36,
-        "heads":   20,
-        "vram_gb": 3.0,
-        "cpu_ok":  False,
-    },
-    "gpt2-xl": {
-        "hf_id":   "gpt2-xl",
-        "family":  "GPT-2",
-        "params":  "1.5B",
-        "layers":  48,
-        "heads":   25,
-        "vram_gb": 6.0,
-        "cpu_ok":  False,
-    },
-    # ── BERT family ───────────────────────────────────────────────────────
-    "bert-base": {
-        "hf_id":   "bert-base-uncased",
-        "family":  "BERT",
-        "params":  "110M",
-        "layers":  12,
-        "heads":   12,
-        "vram_gb": 0.5,
-        "cpu_ok":  True,
-    },
-    "bert-large": {
-        "hf_id":   "bert-large-uncased",
-        "family":  "BERT",
-        "params":  "340M",
-        "layers":  24,
-        "heads":   16,
-        "vram_gb": 1.5,
-        "cpu_ok":  True,
-    },
-    # ── DistilBERT ────────────────────────────────────────────────────────
-    "distilbert": {
-        "hf_id":   "distilbert-base-uncased",
-        "family":  "DistilBERT",
-        "params":  "66M",
-        "layers":  6,
-        "heads":   12,
-        "vram_gb": 0.3,
-        "cpu_ok":  True,
-    },
-    # ── RoBERTa ───────────────────────────────────────────────────────────
-    "roberta-base": {
-        "hf_id":   "roberta-base",
-        "family":  "RoBERTa",
-        "params":  "125M",
-        "layers":  12,
-        "heads":   12,
-        "vram_gb": 0.5,
-        "cpu_ok":  True,
-    },
-    "roberta-large": {
-        "hf_id":   "roberta-large",
-        "family":  "RoBERTa",
-        "params":  "355M",
-        "layers":  24,
-        "heads":   16,
-        "vram_gb": 1.5,
-        "cpu_ok":  True,
-    },
-    # ── GPT-Neo ───────────────────────────────────────────────────────────
-    "gpt-neo-125m": {
-        "hf_id":   "EleutherAI/gpt-neo-125m",
-        "family":  "GPT-Neo",
-        "params":  "125M",
-        "layers":  12,
-        "heads":   12,
-        "vram_gb": 0.5,
-        "cpu_ok":  True,
-    },
-    "gpt-neo-1.3b": {
-        "hf_id":   "EleutherAI/gpt-neo-1.3B",
-        "family":  "GPT-Neo",
-        "params":  "1.3B",
-        "layers":  24,
-        "heads":   16,
-        "vram_gb": 5.5,
-        "cpu_ok":  False,
-    },
-}
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-def list_models():
-    """Print a formatted table of all supported models and exit."""
-    has_cuda = torch.cuda.is_available()
-    device_label = "GPU available ✓" if has_cuda else "CPU only (no GPU detected)"
-    print(f"\nDevice: {device_label}\n")
+def _fmt_params(n: int) -> str:
+    if n >= 1_000_000_000:
+        return f"{n/1e9:.1f}B"
+    if n >= 1_000_000:
+        return f"{n/1e6:.0f}M"
+    return str(n)
 
-    col = "{:<16} {:<12} {:<8} {:<8} {:<8} {:<9} {}"
-    print(col.format("NAME", "FAMILY", "PARAMS", "LAYERS", "HEADS", "VRAM(GB)", "CPU OK?"))
-    print("-" * 72)
 
-    current_family = None
-    for name, m in MODELS.items():
-        if m["family"] != current_family:
-            if current_family is not None:
-                print()
-            current_family = m["family"]
+def _vram_gb(n_params: int) -> str:
+    gb = n_params * 2 * 1.2 / 1e9
+    return f"~{gb:.1f}"
 
-        cpu_flag = "✓" if m["cpu_ok"] else "slow"
-        gpu_warn = "" if has_cuda or m["cpu_ok"] else "  ⚠ GPU recommended"
-        print(col.format(
-            name,
-            m["family"],
-            m["params"],
-            m["layers"],
-            m["heads"],
-            f"~{m['vram_gb']}",
-            cpu_flag + gpu_warn,
-        ))
 
-    print(f"\nUsage:  python aga_script.py --model <NAME>\n")
+def _cpu_ok(n_params: int) -> str:
+    gb = n_params * 2 * 1.2 / 1e9
+    if gb <= 2:
+        return "✓"
+    if gb <= 8:
+        return "slow"
+    return "✗"
+
+
+def _fetch_config(model_id: str) -> dict:
+    """Fetch config.json from HF Hub. Returns {} on failure."""
+    try:
+        from huggingface_hub import hf_hub_download
+        import json
+        path = hf_hub_download(repo_id=model_id, filename="config.json", repo_type="model")
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _layers_heads(cfg: dict) -> tuple:
+    """Extract (n_layers, n_heads) from a config dict."""
+    layers = (cfg.get("num_hidden_layers")
+              or cfg.get("n_layer")
+              or cfg.get("num_layers"))
+    heads  = (cfg.get("num_attention_heads")
+              or cfg.get("n_head")
+              or cfg.get("num_heads"))
+    return (layers or "?", heads or "?")
+
+
+def list_models(search: str = "", limit: int = 20):
+    try:
+        from huggingface_hub import list_models as hf_list_models
+    except ImportError:
+        print("huggingface_hub not installed. Run: pip install huggingface_hub")
+        return
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    print(f"[AGA] Querying HuggingFace Hub (pipeline_tag=text-generation, limit={limit}"
+          + (f", search='{search}'" if search else "") + ")...")
+
+    kwargs = dict(
+        pipeline_tag="text-generation",
+        sort="downloads",
+        limit=limit,
+        expand=["safetensors"],
+    )
+    if search:
+        kwargs["search"] = search
+
+    models = list(hf_list_models(**kwargs))
+    if not models:
+        print("No models found.")
+        return
+
+    print(f"[AGA] Fetching configs for {len(models)} models...\n")
+
+    # Fetch configs concurrently
+    configs = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_config, m.id): m.id for m in models}
+        for fut in as_completed(futures):
+            configs[futures[fut]] = fut.result()
+
+    # Derive short NAME and FAMILY from model id  (e.g. "Qwen/Qwen2.5-7B" -> "Qwen2.5-7B", "Qwen")
+    def _name_family(model_id: str) -> tuple:
+        parts  = model_id.split("/")
+        name   = parts[-1]
+        org    = parts[0] if len(parts) > 1 else ""
+        # Map known orgs/prefixes to friendly family names
+        family_map = [
+            ("Qwen",        "Qwen"),
+            ("meta-llama",  "LLaMA"),
+            ("mistralai",   "Mistral"),
+            ("openai-community", "GPT"),
+            ("openai",      "GPT"),
+            ("google",      "Gemma"),
+            ("microsoft",   "Phi"),
+            ("facebook",    "OPT"),
+            ("EleutherAI",  "GPT-Neo"),
+            ("deepseek-ai", "DeepSeek"),
+            ("trl-internal-testing", "Test"),
+        ]
+        family = org  # fallback
+        for key, label in family_map:
+            if key.lower() in org.lower() or key.lower() in name.lower():
+                family = label
+                break
+        return name, family
+
+    print(f"{'NAME':<30} {'FAMILY':<12} {'PARAMS':>7}  {'LAYERS':>6}  {'HEADS':>5}  {'VRAM(GB)':>8}  {'CPU OK?'}")
+    print("-" * 80)
+    for m in models:
+        st       = getattr(m, "safetensors", None)
+        n_params = st.total if st else 0
+        params_s = _fmt_params(n_params) if n_params else "?"
+        vram_s   = _vram_gb(n_params)    if n_params else "?"
+        cpu_s    = _cpu_ok(n_params)     if n_params else "?"
+        cfg      = configs.get(m.id, {})
+        layers, heads = _layers_heads(cfg)
+        name, family  = _name_family(m.id)
+        print(f"{name:<30} {family:<12} {params_s:>7}  {layers:>6}  {heads:>5}  {vram_s:>8}  {cpu_s}")
+
+    print(f"\n{len(models)} models listed.")
+    print("\nUsage example:")
+    print(f"  python aga_script.py --model {models[0].id}")
 
 
 def extract(
@@ -183,24 +153,32 @@ def extract(
     tau: float = 0.01,
     outdir: str = "./aga_out",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    trust_remote_code: bool = True,
 ):
-    if model_name not in MODELS:
-        print(f"[AGA] Unknown model '{model_name}'. Run --list-models to see options.")
-        sys.exit(1)
-
-    meta = MODELS[model_name]
-    hf_id = meta["hf_id"]
-
-    if device == "cpu" and not meta["cpu_ok"]:
-        print(f"[AGA] Warning: {model_name} ({meta['params']}) is slow on CPU. "
-              "Consider a smaller model or use --list-models to compare.")
-
     os.makedirs(outdir, exist_ok=True)
 
-    print(f"[AGA] Loading {model_name} ({hf_id}) on {device}...")
-    tokenizer = AutoTokenizer.from_pretrained(hf_id)
-    model = AutoModel.from_pretrained(hf_id, output_attentions=True)
-    model.eval().to(device)
+    print(f"[AGA] Loading {model_name} on {device}...")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=trust_remote_code,
+    )
+
+    # Some tokenizers (e.g. Qwen) don't set a pad token by default
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        output_attentions=True,
+        trust_remote_code=trust_remote_code,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        device_map="auto" if device == "cuda" else None,
+        attn_implementation="eager",  # required for output_attentions on flash-attn models
+    )
+    model.eval()
+    if device != "cuda":
+        model.to(device)
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     n_tokens = inputs["input_ids"].shape[1]
@@ -211,16 +189,22 @@ def extract(
         outputs = model(**inputs)
 
     attentions = outputs.attentions  # tuple: (batch, heads, N, N) per layer
+    if attentions is None:
+        raise RuntimeError(
+            "Model did not return attentions. "
+            "Make sure the model supports output_attentions=True "
+            "and attn_implementation='eager'."
+        )
+
     n_layers = len(attentions)
-    n_heads  = attentions[0].shape[1]
+    n_heads = attentions[0].shape[1]
     print(f"[AGA] {n_layers} layers x {n_heads} heads | tau={tau}")
 
     total_edges = 0
     for layer in range(n_layers):
         for head in range(n_heads):
-            attn = attentions[layer][0, head].cpu().numpy()  # (N, N)
+            attn = attentions[layer][0, head].float().cpu().numpy()  # (N, N)
 
-            # Threshold and write SNAP edge list (undirected: i < j only)
             path = os.path.join(outdir, f"aga_L{layer:02d}_H{head:02d}.txt")
             n_edges = 0
             lines = []
@@ -241,37 +225,45 @@ def extract(
             total_edges += n_edges
             print(f"  L{layer:02d} H{head:02d} -> {n_edges:5d} edges -> {path}")
 
-    print(f"\n[AGA] Done. {n_layers * n_heads} files written to {outdir}/ "
-          f"(total edges: {total_edges})")
+    print(f"\n[AGA] Done. {n_layers * n_heads} files written to {outdir}/")
+    print(f"[AGA] Total edges across all graphs: {total_edges}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="AGA-script: attention -> SNAP edge lists",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Run --list-models to see all supported models.",
-    )
-    parser.add_argument("--list-models", action="store_true",
-                        help="Print supported models and exit")
-    parser.add_argument("--model",  default="gpt2",
-                        help=f"Model name (default: gpt2). One of: {', '.join(MODELS)}")
-    parser.add_argument("--tau",    type=float, default=0.01,
+    parser = argparse.ArgumentParser(description="AGA-script: attention -> SNAP edge lists")
+    parser.add_argument("--model", default="gpt2",
+                        help="HuggingFace model ID (default: gpt2)")
+    parser.add_argument("--tau", type=float, default=0.01,
                         help="Attention threshold (default: 0.01)")
     parser.add_argument("--prompt", default="The quick brown fox jumps over the lazy dog",
-                        help="Input prompt for the model")
+                        help="Input prompt")
     parser.add_argument("--outdir", default="./aga_out",
-                        help="Output directory for SNAP files (default: ./aga_out)")
+                        help="Output directory (default: ./aga_out)")
+    parser.add_argument("--device", default=None,
+                        help="Device: cuda / cpu (default: auto-detect)")
+    parser.add_argument("--list-models", action="store_true",
+                        help="Query HuggingFace Hub for top text-generation models and exit")
+    parser.add_argument("--search", default="",
+                        help="Filter --list-models by name (e.g. 'qwen', 'mistral')")
+    parser.add_argument("--limit", type=int, default=20,
+                        help="Number of models to show with --list-models (default: 20)")
+    parser.add_argument("--no-trust-remote-code", action="store_true",
+                        help="Disable trust_remote_code (may break Qwen)")
     args = parser.parse_args()
 
     if args.list_models:
-        list_models()
-        sys.exit(0)
+        list_models(search=args.search, limit=args.limit)
+        return
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     extract(
         model_name=args.model,
         prompt=args.prompt,
         tau=args.tau,
         outdir=args.outdir,
+        device=device,
+        trust_remote_code=not args.no_trust_remote_code,
     )
 
 
