@@ -1,0 +1,13 @@
+services:
+  hf:
+    build: .
+    container_name: hf
+    environment:
+      - HF_HOME=/models
+      - TRANSFORMERS_CACHE=/models
+    volumes:
+      - ./scripts:/app/scripts:ro,z
+      - ./aga_out:/app/aga_out:z
+      - ${HF_MODELS_DIR:-/home/amitp/hf_models}:/models:z
+    working_dir: /app
+    command: ["python", "-u", "scripts/aga_script.py", "--outdir", "aga_out"]
